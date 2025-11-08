@@ -1,168 +1,175 @@
-use std::{sync::Arc};
-use tokio::sync::Mutex;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use axum::{
-    Router, extract::{self, Path, State}, http::StatusCode, response::{IntoResponse, Json}, routing::{get, patch}
+    Router, extract::{self, Path, State}, http::StatusCode, response::{IntoResponse, Json}, routing::{get}
 };
 use uuid::Uuid;
-use crate::{AppState, auth::AuthenticatedUser, routes::{CreateTodo, TodoItem, UpdateTodo, get_date, get_todo_by_id}};
+use crate::{AppState, auth::AuthenticatedUser, routes::{CreateTodo, TodoItem, UpdateTodo, get_date}};
 
-
-pub fn routes() -> Router<Arc<Mutex<AppState>>> {
+pub fn routes() -> Router<Arc<RwLock<AppState>>> {
     Router::new()
         .route("/", get(get_all_todos).post(create_todo))
-        .route("/{todo_id}", patch(update_todo).delete(delete_todo).get(get_todo))
+        .route("/{todo_id}", get(get_todo).patch(update_todo).delete(delete_todo))
 }
 
+/// Get all todos for the authenticated user
 async fn get_all_todos(
     AuthenticatedUser(user_id): AuthenticatedUser,
-    State(st): State<Arc<Mutex<AppState>>>,
-) -> Json<Vec<TodoItem>> {
-    let state = st.lock().await;
+    State(st): State<Arc<RwLock<AppState>>>,
+) -> impl IntoResponse {
+    let state = st.read().await;
 
-    Json(state.users[&user_id].todos.clone())
+    match state.users.get(&user_id) {
+        Some(user) => (StatusCode::OK, Json(user.todos.clone())).into_response(),
+        None => (StatusCode::NOT_FOUND, "User not found").into_response()
+    }
 }
 
+/// Create a new todo for the authenticated user
 async fn create_todo(
     AuthenticatedUser(user_id): AuthenticatedUser,
-    State(st): State<Arc<Mutex<AppState>>>,
+    State(st): State<Arc<RwLock<AppState>>>,
     extract::Json(new_todo): extract::Json<CreateTodo>
 ) -> impl IntoResponse {
-    let mut state = st.lock().await;
+    // Validate input
+    if new_todo.name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Todo name cannot be empty").into_response();
+    }
 
-    let new_todo = TodoItem {
+    let todo = TodoItem {
         archived: false,
         cid: user_id.clone(),
         id: Uuid::new_v4().to_string(),
-        name: new_todo.name,
-        description: new_todo.description,
+        name: new_todo.name.trim().to_string(),
+        description: new_todo.description.trim().to_string(),
         done: false,
-        archived_at: "".to_string(),
+        archived_at: None,
         created_at: get_date().to_string(),
-        updated_at: "".to_string(),
-        done_at: "".to_string(),
+        updated_at: None,
+        done_at: None,
     };
 
-    let users_todos = state.users.get_mut(&user_id).cloned();
+    // Write lock to modify user's todos
+    let mut state = st.write().await;
 
-    match users_todos {
-        Some(mut u) => {   
-            u.todos.push(new_todo.clone());
-
-            return (StatusCode::CREATED, Json(new_todo)).into_response()
+    match state.users.get_mut(&user_id) {
+        Some(user) => {
+            user.todos.push(todo.clone());
+            (StatusCode::CREATED, Json(todo)).into_response()
         },
-        None => return (StatusCode::NOT_FOUND, "User dones't exist").into_response()
+        None => (StatusCode::NOT_FOUND, "User not found").into_response()
     }
-
 }
 
+/// Get a specific todo by ID
 async fn get_todo(
     AuthenticatedUser(user_id): AuthenticatedUser,
     Path(todo_id): Path<String>,
-    State(st): State<Arc<Mutex<AppState>>>,
+    State(st): State<Arc<RwLock<AppState>>>,
 ) -> impl IntoResponse {
-    let state = st.lock().await;
+    let state = st.read().await;
 
-    let user = state.users[&user_id].clone();
+    let user = match state.users.get(&user_id) {
+        Some(u) => u,
+        None => return (StatusCode::NOT_FOUND, "User not found").into_response()
+    };
 
-    if let Some(t) = get_todo_by_id(todo_id, user.todos) {
-        if t.cid != user_id {
-            (StatusCode::UNAUTHORIZED, "You do not own this todo").into_response()
-        } else {
-            (StatusCode::OK, Json(t.clone())).into_response()
-        }
-
-
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match user.todos.iter().find(|t| t.id == todo_id) {
+        Some(todo) => {
+            if todo.cid != user_id {
+                (StatusCode::FORBIDDEN, "You do not own this todo").into_response()
+            } else {
+                (StatusCode::OK, Json(todo.clone())).into_response()
+            }
+        },
+        None => (StatusCode::NOT_FOUND, "Todo not found").into_response()
     }
-
 }
 
+/// Delete a todo by ID
 async fn delete_todo(
     AuthenticatedUser(user_id): AuthenticatedUser,
     Path(todo_id): Path<String>,
-    State(st): State<Arc<Mutex<AppState>>>,
+    State(st): State<Arc<RwLock<AppState>>>,
 ) -> impl IntoResponse {
-    let mut state = st.lock().await;
+    let mut state = st.write().await;
 
-    let user = state.users.get_mut(&user_id);
-
-    match user {
-        Some(todos) => {
-            let requested_todo = get_todo_by_id(todo_id, todos);
-        
-            if let Some(t) = requested_todo {
-        
-                if t.cid != user_id {
-                    return (StatusCode::UNAUTHORIZED, "You do not own this todo").into_response()
-                } else {
-        
-        
-        
-                    todos.retain(|t| t.id != todo_id);
-                
-                    return (StatusCode::OK, Json(t.clone())).into_response()
-                }
-        
-            } else {
-                return StatusCode::NOT_FOUND.into_response()
-        
-            }
-        },
+    let user = match state.users.get_mut(&user_id) {
+        Some(u) => u,
         None => return (StatusCode::NOT_FOUND, "User not found").into_response()
+    };
+
+    // Find the todo
+    let todo = match user.todos.iter().find(|t| t.id == todo_id) {
+        Some(t) => t.clone(),
+        None => return (StatusCode::NOT_FOUND, "Todo not found").into_response()
+    };
+
+    // Verify ownership
+    if todo.cid != user_id {
+        return (StatusCode::FORBIDDEN, "You do not own this todo").into_response();
     }
-    
 
-    
-    
-    
+    // Remove the todo
+    user.todos.retain(|t| t.id != todo_id);
 
+    (StatusCode::OK, Json(todo)).into_response()
 }
 
+/// Update a todo by ID
 async fn update_todo( 
     AuthenticatedUser(user_id): AuthenticatedUser,
     Path(todo_id): Path<String>,
-    State(st): State<Arc<Mutex<AppState>>>,
-    extract::Json(new_todo): extract::Json<UpdateTodo>
+    State(st): State<Arc<RwLock<AppState>>>,
+    extract::Json(update): extract::Json<UpdateTodo>
 ) -> impl IntoResponse {
+    let mut state = st.write().await;
 
-    let mut state = st.lock().await;
+    let user = match state.users.get_mut(&user_id) {
+        Some(u) => u,
+        None => return (StatusCode::NOT_FOUND, "User not found").into_response()
+    };
 
-    let requested_todo = state.todos.iter_mut().find(|t| t.id == todo_id).cloned();
-    
-    if let Some(mut t) = requested_todo {
+    let todo = match user.todos.iter_mut().find(|t| t.id == todo_id) {
+        Some(t) => t,
+        None => return (StatusCode::NOT_FOUND, "Todo not found").into_response()
+    };
 
-        if t.cname != username {
-            return (StatusCode::UNAUTHORIZED, "You do not own this todo").into_response()
-        };
-
-        t.updated_at = get_date().to_string();
-         
-        if let Some(n) = new_todo.name {
-            t.name = n
-        };
-
-        if let Some(arch) = new_todo.archived {
-            t.archived = arch;
-            t.archived_at = get_date().to_string()
-        };
-
-        if let Some(desc) = new_todo.description {
-            t.description = desc
-        };
-
-        if let Some(d) = new_todo.done {
-            t.done = d;
-            t.done_at = get_date().to_string()
-        };
-
-        state.todos.retain(|tod| tod.id != todo_id);
-
-        state.todos.push(t.clone());
-
-        (StatusCode::OK, Json(t)).into_response()
-
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    // Verify ownership
+    if todo.cid != user_id {
+        return (StatusCode::FORBIDDEN, "You do not own this todo").into_response();
     }
+
+    // Update fields
+    let mut updated = false;
+
+    if let Some(name) = update.name {
+        if !name.trim().is_empty() {
+            todo.name = name.trim().to_string();
+            updated = true;
+        }
+    }
+
+    if let Some(description) = update.description {
+        todo.description = description.trim().to_string();
+        updated = true;
+    }
+
+    if let Some(done) = update.done {
+        todo.done = done;
+        todo.done_at = if done { Some(get_date().to_string()) } else { None };
+        updated = true;
+    }
+
+    if let Some(archived) = update.archived {
+        todo.archived = archived;
+        todo.archived_at = if archived { Some(get_date().to_string()) } else { None };
+        updated = true;
+    }
+
+    if updated {
+        todo.updated_at = Some(get_date().to_string());
+    }
+
+    (StatusCode::OK, Json(todo.clone())).into_response()
 }

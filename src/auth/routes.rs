@@ -1,155 +1,189 @@
 use std::sync::Arc;
 use axum::{
-    Json, Router, extract::{self, State}, http::StatusCode, response::IntoResponse, routing::{get, post}
+    Json, Router, extract::{self, State}, http::StatusCode, response::IntoResponse, routing::{post}
 };
 use chrono::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use uuid::Uuid;
-use crate::{auth::{AuthenticatedRefToken, CreateAccount, JWT_REF_SECRET, JWT_SECRET, Login, User, gen_token}, routes::get_user_by_name};
+use crate::{
+    auth::{
+        AuthenticatedRefToken, CreateAccount, Login, User, 
+        gen_token, hash_password, validate_password, verify_password
+    }
+};
 use crate::AppState;
 
-pub fn routes() -> Router<Arc<Mutex<AppState>>> {
+pub fn routes() -> Router<Arc<RwLock<AppState>>> {
     Router::new()
         .route("/login", post(login))
-        .route("/logout", get(logout))
+        .route("/logout", post(logout))
         .route("/signup", post(signup))
-        .route("/users", get(get_users))
         .route("/refresh", post(refresh))
 }
 
-async fn get_users(
-    State(st): State<Arc<Mutex<AppState>>>,
-) -> impl IntoResponse {
-    let state = st.lock().await;
-
-    let users: Vec<User> = state.users.values().cloned().collect();
-
-    return (StatusCode::OK, Json(users)).into_response()
-}
-
-#[axum::debug_handler]
+/// Login endpoint - authenticates user and sets session cookies
 async fn login(
-    State(st): State<Arc<Mutex<AppState>>>,
+    State(st): State<Arc<RwLock<AppState>>>,
     jar: CookieJar,
-    extract::Json(deets): extract::Json<Login>,
+    extract::Json(credentials): extract::Json<Login>,
 ) -> impl IntoResponse {
-    let state = st.lock().await;
+    // Read lock for user lookup - allows concurrent reads
+    let state = st.read().await;
+    
+    // Find user by username (O(1) with our new index)
+    let user_id = match state.username_to_id.get(&credentials.username) {
+        Some(id) => id,
+        None => return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+    };
 
-    let user = get_user_by_name(deets.username, state.users.clone());
+    let user = match state.users.get(user_id) {
+        Some(u) => u,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "User data inconsistent").into_response()
+    };
 
-    match user {
-        Some(user) => {
-
-            if user.password != deets.password {
-                return StatusCode::UNAUTHORIZED.into_response()
-            };
-            
-            let auth_token = match gen_token(user.id.clone(), JWT_SECRET, Duration::hours(1)) {
-                Ok(t) => t,
-                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate auth token").into_response()
-            };
-
-            let ref_token = match gen_token(user.id.clone(), JWT_REF_SECRET, Duration::hours(8)) {
-                Ok(t) => t,
-                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate refresh token").into_response()
-            };
-
-            // Set the JWT as an HttpOnly cookie
-            let cookie = Cookie::build(("session", auth_token))
-                .path("/")
-                .http_only(true)
-                .secure(true) // Should be secure in production (HTTPS)
-                .same_site(axum_extra::extract::cookie::SameSite::Strict)
-                .build();
-
-            let ref_cookie = Cookie::build(("refresh_session", ref_token))
-                .path("/")
-                .http_only(true)
-                .secure(true) // Should be secure in production (HTTPS)
-                .same_site(axum_extra::extract::cookie::SameSite::Strict)
-                .build();
-
-            // Return the CookieJar with the added cookie
-            (StatusCode::OK, jar.add(cookie).add(ref_cookie), "Login successful, cookie set").into_response()
-
-        },
-        None => return StatusCode::NOT_FOUND.into_response()
+    // Verify password with constant-time comparison
+    if let Err(_) = verify_password(&credentials.password, &user.password_hash) {
+        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
     }
+
+    // Clone user ID and config before releasing lock
+    let user_id = user.id.clone();
+    let config = state.config.clone();
+    drop(state); // Explicitly release lock before expensive operations
+
+    // Generate tokens outside of lock (expensive operations)
+    let auth_token = match gen_token(user_id.clone(), &config.jwt_secret, Duration::hours(1)) {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate auth token").into_response()
+    };
+
+    let ref_token = match gen_token(user_id, &config.jwt_refresh_secret, Duration::hours(8)) {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate refresh token").into_response()
+    };
+
+    // Build secure cookies
+    let cookie = Cookie::build(("session", auth_token))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(axum_extra::extract::cookie::SameSite::Strict)
+        .build();
+
+    let ref_cookie = Cookie::build(("refresh_session", ref_token))
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(axum_extra::extract::cookie::SameSite::Strict)
+        .build();
+
+    (StatusCode::OK, jar.add(cookie).add(ref_cookie), Json(serde_json::json!({
+        "message": "Login successful"
+    }))).into_response()
 }
 
-
+/// Refresh endpoint - generates new tokens from valid refresh token
 async fn refresh(
+    State(st): State<Arc<RwLock<AppState>>>,
     jar: CookieJar,
     AuthenticatedRefToken(user_id): AuthenticatedRefToken
 ) -> impl IntoResponse {
+    // Verify user still exists
+    let state = st.read().await;
+    if !state.users.contains_key(&user_id) {
+        return (StatusCode::UNAUTHORIZED, "User not found").into_response();
+    }
+    
+    let config = state.config.clone();
+    drop(state);
 
-    let no_auth_jar = jar.remove("session");
-    let no_ref_jar = no_auth_jar.remove("refresh_session");
+    // Remove old cookies
+    let jar = jar.remove("session").remove("refresh_session");
 
-    let new_auth_token = match gen_token(user_id.clone(), JWT_SECRET, Duration::hours(1)) {
+    // Generate new tokens
+    let new_auth_token = match gen_token(user_id.clone(), &config.jwt_secret, Duration::hours(1)) {
         Ok(t) => t,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate new auth token").into_response()
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate auth token").into_response()
     };
 
-    let new_ref_token = match gen_token(user_id.clone(), JWT_REF_SECRET, Duration::hours(8)) {
+    let new_ref_token = match gen_token(user_id, &config.jwt_refresh_secret, Duration::hours(8)) {
         Ok(t) => t,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate new auth token").into_response()
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate refresh token").into_response()
     };
 
     let cookie = Cookie::build(("session", new_auth_token))
         .path("/")
         .http_only(true)
-        .secure(true) // Should be secure in production (HTTPS)
+        .secure(true)
         .same_site(axum_extra::extract::cookie::SameSite::Strict)
         .build();
 
     let ref_cookie = Cookie::build(("refresh_session", new_ref_token))
         .path("/")
         .http_only(true)
-        .secure(true) // Should be secure in production (HTTPS)
+        .secure(true)
         .same_site(axum_extra::extract::cookie::SameSite::Strict)
         .build();
 
-    (StatusCode::OK, no_ref_jar.add(cookie).add(ref_cookie), "Refresh successful, cookies set").into_response()
-    
+    (StatusCode::OK, jar.add(cookie).add(ref_cookie), Json(serde_json::json!({
+        "message": "Tokens refreshed"
+    }))).into_response()
 }
 
-async fn logout(
-    jar: CookieJar
-) -> impl IntoResponse {
-
-    if let Some(_c) = jar.get("session") {
-        let new_jar = jar.remove("session");
-
-        (StatusCode::OK, new_jar).into_response()
-    } else {
-        StatusCode::OK.into_response()
-    }
+/// Logout endpoint - removes session cookies
+async fn logout(jar: CookieJar) -> impl IntoResponse {
+    let jar = jar.remove("session").remove("refresh_session");
+    (StatusCode::OK, jar, Json(serde_json::json!({
+        "message": "Logged out successfully"
+    }))).into_response()
 }
 
-
+/// Signup endpoint - creates new user account
 async fn signup(
-    State(st): State<Arc<Mutex<AppState>>>,
-    extract::Json(accnt_info): extract::Json<CreateAccount>
+    State(st): State<Arc<RwLock<AppState>>>,
+    extract::Json(account_info): extract::Json<CreateAccount>
 ) -> impl IntoResponse {
-    let mut state = st.lock().await;
-
-    let user = get_user_by_name(accnt_info.username.clone(), state.users.clone());
-
-    match user {
-        Some(_) => StatusCode::CONFLICT.into_response(),
-        None => {
-            let new_user = User {
-                todos: vec![],
-                id: Uuid::new_v4().to_string(),
-                username: accnt_info.username,
-                password: accnt_info.password
-            };
-
-            state.users.insert(new_user.id.clone(), new_user);
-
-            StatusCode::CREATED.into_response()
-        }
+    // Validate username
+    if account_info.username.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "Username cannot be empty").into_response();
     }
+
+    if account_info.username.len() < 3 {
+        return (StatusCode::BAD_REQUEST, "Username must be at least 3 characters").into_response();
+    }
+
+    // Validate password strength
+    if let Err(e) = validate_password(&account_info.password) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    // Hash password outside of lock
+    let password_hash = match hash_password(&account_info.password) {
+        Ok(h) => h,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to hash password").into_response()
+    };
+
+    // Write lock for user creation
+    let mut state = st.write().await;
+
+    // Check if username already exists
+    if state.username_to_id.contains_key(&account_info.username) {
+        return (StatusCode::CONFLICT, "Username already taken").into_response();
+    }
+
+    let new_user = User {
+        todos: Vec::new(),
+        id: Uuid::new_v4().to_string(),
+        username: account_info.username.clone(),
+        password_hash,
+    };
+
+    // Insert into both maps
+    state.username_to_id.insert(account_info.username, new_user.id.clone());
+    state.users.insert(new_user.id.clone(), new_user);
+
+    (StatusCode::CREATED, Json(serde_json::json!({
+        "message": "Account created successfully"
+    }))).into_response()
 }

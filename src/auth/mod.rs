@@ -3,15 +3,16 @@ use axum::{
 };
 use chrono::Duration;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use axum_extra::extract::{CookieJar};
+use axum_extra::extract::CookieJar;
 use jsonwebtoken::{decode, encode, Header, DecodingKey, EncodingKey, Validation};
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2
+};
 
 use crate::routes::{TodoItem, get_date};
 
 pub mod routes;
-
-const JWT_SECRET: &[u8] = b"THE_JWT_SECRET";
-const JWT_REF_SECRET: &[u8] = b"THE_REFRESH_SECRET";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct AuthClaims {
@@ -24,28 +25,64 @@ pub struct AuthClaims {
 pub struct User {
     pub id: String,
     pub username: String,
-    pub password: String,
+    #[serde(skip_serializing)] // Never send password hash to client
+    pub password_hash: String,
     pub todos: Vec<TodoItem>
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub struct CreateAccount {
-    username: String,
-    password: String
+    pub username: String,
+    pub password: String
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Login {
-    username: String,
-    password: String
+    pub username: String,
+    pub password: String
 }
 
+/// Validates password strength
+pub fn validate_password(password: &str) -> Result<(), String> {
+    if password.len() < 8 {
+        return Err("Password must be at least 8 characters".to_string());
+    }
+    if !password.chars().any(|c| c.is_numeric()) {
+        return Err("Password must contain at least one number".to_string());
+    }
+    if !password.chars().any(|c| c.is_alphabetic()) {
+        return Err("Password must contain at least one letter".to_string());
+    }
+    Ok(())
+}
+
+/// Hashes a password using Argon2
+pub fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| format!("Failed to hash password: {}", e))
+        .map(|hash| hash.to_string())
+}
+
+/// Verifies a password against a hash using constant-time comparison
+pub fn verify_password(password: &str, password_hash: &str) -> Result<(), String> {
+    let parsed_hash = PasswordHash::new(password_hash)
+        .map_err(|e| format!("Invalid password hash: {}", e))?;
+    
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .map_err(|_| "Invalid password".to_string())
+}
+
+/// Generates a JWT token with the given user ID and secret key
 pub fn gen_token(
     uid: String,
-    key: &[u8],
+    secret: &str,
     ttl: Duration,
 ) -> Result<String, String> {
-
     let now = get_date();
     let expiration = now + ttl;
     let claims = AuthClaims {
@@ -54,35 +91,34 @@ pub fn gen_token(
         iat: now.timestamp() as usize,
     };
 
-    match encode(
+    encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(key),
-    ) {
-        Ok(t) => return Ok(t),
-        Err(_) => return Err("Failed to generate token".to_string()),
-    };
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|_| "Failed to generate token".to_string())
 }
 
+/// Validates a JWT token and returns the claims
 pub fn validate_token<T: Clone + DeserializeOwned>(
-    token: String,
-    key: &[u8]
+    token: &str,
+    secret: &str
 ) -> Result<T, String> {
     let claims = decode::<T>(
-        &token,
-        &DecodingKey::from_secret(key),
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
         &Validation::default(),
     )
     .map_err(|_| "Invalid token".to_string())?
     .claims;
 
-    Ok(claims.clone())
+    Ok(claims)
 }
 
-
-
-
+/// Extractor for authenticated users from session cookie
 pub struct AuthenticatedUser(pub String);
+
+/// Extractor for refresh token validation
 pub struct AuthenticatedRefToken(pub String);
 
 impl<S> FromRequestParts<S> for AuthenticatedUser
@@ -93,26 +129,25 @@ where
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_request_parts(parts, state)
-            .await
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Cookie extraction failed"))?;
+        let jar = CookieJar::from_headers(&parts.headers);
 
-        // Get the token from the "session" cookie
         let token = jar
             .get("session")
-            .map(|cookie| cookie.value().to_owned())
-            .ok_or((StatusCode::UNAUTHORIZED, "Session Cookie Not Found"))?;
+            .map(|cookie| cookie.value())
+            .ok_or((StatusCode::UNAUTHORIZED, "Session cookie not found"))?;
 
+        // Get JWT secret from extensions (added in main.rs)
+        let jwt_secret = parts
+            .extensions
+            .get::<String>()
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "JWT secret not configured"))?;
 
-        let claims = validate_token::<AuthClaims>(token, JWT_SECRET);
+        let claims = validate_token::<AuthClaims>(token, jwt_secret)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid auth token"))?;
 
-        match claims {
-            Ok(c) => return Ok(AuthenticatedUser(c.uid)),
-            Err(_) => return Err((StatusCode::UNAUTHORIZED, "Invalid Auth Token"))
-        }
-
+        Ok(AuthenticatedUser(claims.uid))
     }
 }
 
@@ -124,28 +159,24 @@ where
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        state: &S,
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_request_parts(parts, state)
-            .await
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Cookie extraction failed"))?;
+        let jar = CookieJar::from_headers(&parts.headers);
 
-        // Get the token from the "session" cookie
         let token = jar
             .get("refresh_session")
-            .map(|cookie| cookie.value().to_owned())
-            .ok_or((StatusCode::UNAUTHORIZED, "Refresh Session Cookie Not Found"))?;
+            .map(|cookie| cookie.value())
+            .ok_or((StatusCode::UNAUTHORIZED, "Refresh session cookie not found"))?;
 
+        // Get JWT refresh secret from extensions
+        let jwt_refresh_secret = parts
+            .extensions
+            .get::<String>()
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "JWT refresh secret not configured"))?;
 
-        let claims = validate_token::<AuthClaims>(token, JWT_REF_SECRET);
+        let claims = validate_token::<AuthClaims>(token, jwt_refresh_secret)
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid refresh token"))?;
 
-        match claims {
-            Ok(c) => return Ok(AuthenticatedRefToken(c.uid)),
-            Err(_) => return Err((StatusCode::UNAUTHORIZED, "Invalid Refresh Token"))
-        }
-
+        Ok(AuthenticatedRefToken(claims.uid))
     }
 }
-
-
-

@@ -1,73 +1,39 @@
-use std::collections::HashMap;
-
 use serde::{Serialize, Deserialize};
 use chrono::{Utc, DateTime, FixedOffset};
 
-use crate::auth::User;
-
-
 pub mod routes;
-
-
 
 #[derive(Deserialize)]
 pub struct CreateTodo {
-    name: String,
-    description: String
+    pub name: String,
+    pub description: String
 }
 
 #[derive(Deserialize)]
 pub struct UpdateTodo {
-    name: Option<String>,
-    archived: Option<bool>,
-    done: Option<bool>,
-    description: Option<String>
+    pub name: Option<String>,
+    pub archived: Option<bool>,
+    pub done: Option<bool>,
+    pub description: Option<String>
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TodoItem {
-    name: String,
-    done: bool,
-    description: String,
-    archived: bool,
-    cid: String,
-    id: String,
-    created_at: String,
-    done_at: String,
-    updated_at: String,
-    archived_at: String
+    pub name: String,
+    pub done: bool,
+    pub description: String,
+    pub archived: bool,
+    pub cid: String,  // Creator/owner ID
+    pub id: String,
+    pub created_at: String,
+    pub done_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub archived_at: Option<String>
 }
 
-
-
+/// Gets current date/time in CST timezone
 pub fn get_date() -> DateTime<FixedOffset> {
     let now_utc: DateTime<Utc> = Utc::now();
-
-    // Define the CST offset (UTC-6)
     let cst_offset = FixedOffset::west_opt(6 * 3600).unwrap(); 
-
-    // Convert the UTC time to CST
     now_utc.with_timezone(&cst_offset)
-}
-
-pub fn get_user_by_name(
-    username: String,
-    users: HashMap<String, User>
-) -> Option<User> {
-
-    let user: Option<User> = users.values().find(|u| u.username == username).cloned();
-
-    match user {
-        Some(u) => return Some(u),
-        None => return None
-    }
-}
-
-pub fn get_todo_by_id(
-    todo_id: String,
-    todos: Vec<TodoItem>
-) -> Option<TodoItem> {
-    let requested_todo: Option<TodoItem> = todos.iter().find(|t| t.id == todo_id).cloned();
-
-    return requested_todo
 }
